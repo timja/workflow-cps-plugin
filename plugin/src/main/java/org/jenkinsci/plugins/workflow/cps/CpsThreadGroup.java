@@ -610,11 +610,21 @@ public final class CpsThreadGroup implements Serializable {
             return;
         }
         File f = execution.getProgramDataFile();
-        saveProgram(f);
+        if (saveProgramTo(f)) {
+            ProgramSavedListener.fireSaved(execution, f);
+        }
     }
 
     @CpsVmThreadOnly
     public void saveProgram(File f) throws IOException {
+        saveProgramTo(f);
+    }
+
+    /**
+     * @return false if nothing was saved, because Jenkins is starting up or shutting down
+     */
+    @CpsVmThreadOnly
+    private boolean saveProgramTo(File f) throws IOException {
         File dir = f.getParentFile();
         File tmpFile = File.createTempFile("atomic", null, dir);
 
@@ -629,7 +639,7 @@ public final class CpsThreadGroup implements Serializable {
                     Level.WARNING,
                     "Skipping save to {0} since Jenkins seems to be either starting up or shutting down",
                     f);
-            return;
+            return false;
         }
 
         boolean serializedOK = false;
@@ -642,6 +652,7 @@ public final class CpsThreadGroup implements Serializable {
             Files.move(
                     tmpFile.toPath(), f.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             LOGGER.fine(() -> f + " saved");
+            return true;
         } catch (RuntimeException e) {
             propagateErrorToWorkflow(e);
             throw new IOException("Failed to persist " + f, e);
