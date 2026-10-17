@@ -25,23 +25,32 @@
 package org.jenkinsci.plugins.workflow.cps;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import hudson.ExtensionList;
 import hudson.ExtensionPoint;
 import java.io.File;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.jenkinsci.plugins.workflow.flow.FlowDurabilityHint;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
 /**
- * Notified each time a running build's program state has been saved, for example to replicate it elsewhere
- * so that another controller can resume the build.
+ * Notified each time a running build's program state ({@code program.dat}) has been saved,
+ * for example to copy the build's state elsewhere so that it can be resumed from there.
  *
- * <p>When this is called, {@code program.dat} has just been atomically replaced, the flow nodes it refers to
- * have been flushed, and the build record reflects the current heads:
- * together these files form a consistent save point from which the build can be resumed.
- * Called on the CPS VM thread, so implementations must be quick (for example copy the files and upload them later)
- * and must not block on the build.
+ * <p>When this is called, {@code program.dat} has just been atomically replaced,
+ * the flow nodes it refers to have been flushed,
+ * and the build record ({@code build.xml}) has been saved after the program,
+ * so together these files form a consistent save point from which the build can be resumed.
+ * (The build record is saved only for the benefit of listeners; with no listener installed nothing extra is written.)
+ *
+ * <p>Timing: the program is saved after every step when the durability hint persists with every step
+ * (see {@link FlowDurabilityHint#isPersistWithEveryStep}), and otherwise only when the build is paused
+ * or Jenkins is shutting down, so under {@link FlowDurabilityHint#PERFORMANCE_OPTIMIZED} this is called rarely.
+ * It is not called when the save was skipped (Jenkins starting up or shutting down), when the build cannot resume,
+ * or for {@link CpsThreadGroup#saveProgram(File)} with an explicit file.
+ *
+ * <p>Called synchronously on the CPS VM thread, which runs every Pipeline build of the controller,
+ * so implementations must return quickly: do no network or other slow I/O here
+ * (for example copy or note the files and upload them from another thread), and do not block on the build.
+ * An exception thrown by an implementation is logged and does not affect the build.
  */
 @Restricted(Beta.class)
 public interface ProgramSavedListener extends ExtensionPoint {
@@ -51,15 +60,4 @@ public interface ProgramSavedListener extends ExtensionPoint {
      * @param programDat the file just written
      */
     void onProgramSaved(@NonNull CpsFlowExecution execution, @NonNull File programDat);
-
-    static void fireSaved(@NonNull CpsFlowExecution execution, @NonNull File programDat) {
-        for (ProgramSavedListener l : ExtensionList.lookup(ProgramSavedListener.class)) {
-            try {
-                l.onProgramSaved(execution, programDat);
-            } catch (RuntimeException e) {
-                Logger.getLogger(ProgramSavedListener.class.getName())
-                        .log(Level.WARNING, l + " failed on program save of " + execution, e);
-            }
-        }
-    }
 }

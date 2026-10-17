@@ -26,15 +26,21 @@ package org.jenkinsci.plugins.workflow.cps;
 
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.google.common.util.concurrent.FutureCallback;
+import hudson.XmlFile;
+import hudson.model.Saveable;
+import hudson.model.listeners.SaveableListener;
 import java.io.File;
-import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.jenkinsci.plugins.workflow.test.steps.SemaphoreStep;
@@ -53,8 +59,12 @@ public class ProgramSavedListenerTest {
     @Rule
     public JenkinsRule r = new JenkinsRule();
 
+    /** Saves and notifications in the order they happened, for builds of job {@code p}. */
+    static final List<String> events = new CopyOnWriteArrayList<>();
+
     @Test
     public void notifiedWithConsistentSavePoints() throws Exception {
+        events.clear();
         WorkflowJob p = r.createProject(WorkflowJob.class, "p");
         p.setDefinition(new CpsFlowDefinition("echo 'one'; semaphore 'wait'; echo 'two'", true));
         WorkflowRun b = p.scheduleBuild2(0).waitForStart();
@@ -67,15 +77,80 @@ public class ProgramSavedListenerTest {
         assertEquals(b.getExecution(), last.execution);
         assertEquals(new File(b.getRootDir(), "program.dat"), last.file);
         assertTrue("program.dat existed when notified", last.existed);
-        assertTrue("build.xml existed when notified", last.recordExisted);
 
         int before = rec.saves.size();
         SemaphoreStep.success("wait/1", null);
         r.assertBuildStatusSuccess(r.waitForCompletion(b));
         assertThat("saved again as the program advanced", rec.saves.size(), greaterThan(before));
+
+        // every notification comes right after a save of the build record
+        for (int i = 0; i < events.size(); i++) {
+            if (events.get(i).equals("notified")) {
+                assertTrue("build.xml saved before notification " + i + " in " + events, i > 0);
+                assertEquals("build.xml saved before notification " + i + " in " + events, "saved", events.get(i - 1));
+            }
+        }
     }
 
-    record Save(CpsFlowExecution execution, File file, boolean existed, boolean recordExisted) {}
+    @Test
+    public void throwingListenerDoesNotAffectBuild() throws Exception {
+        WorkflowJob p = r.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition("echo 'one'; echo 'two'", true));
+        r.buildAndAssertSuccess(p);
+        Thrower thrower = r.jenkins.getExtensionList(ProgramSavedListener.class).get(Thrower.class);
+        assertThat("listener was called", thrower.calls, greaterThan(0));
+        Recorder rec = r.jenkins.getExtensionList(ProgramSavedListener.class).get(Recorder.class);
+        assertThat("other listeners still notified", rec.saves.size(), greaterThan(0));
+    }
+
+    @Test
+    public void notNotifiedWhenResumeIsBlocked() throws Exception {
+        WorkflowJob p = r.createProject(WorkflowJob.class, "p");
+        p.setResumeBlocked(true);
+        p.setDefinition(new CpsFlowDefinition("echo 'one'; semaphore 'wait'; echo 'two'", true));
+        WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+        SemaphoreStep.waitForStart("wait/1", b);
+        SemaphoreStep.success("wait/1", null);
+        r.assertBuildStatusSuccess(r.waitForCompletion(b));
+        Recorder rec = r.jenkins.getExtensionList(ProgramSavedListener.class).get(Recorder.class);
+        assertThat(rec.saves, empty());
+    }
+
+    @Test
+    public void notNotifiedForSaveToExplicitFile() throws Exception {
+        WorkflowJob p = r.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition("semaphore 'wait'", true));
+        WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+        SemaphoreStep.waitForStart("wait/1", b);
+        Recorder rec = r.jenkins.getExtensionList(ProgramSavedListener.class).get(Recorder.class);
+        CpsFlowExecution execution = (CpsFlowExecution) b.getExecution();
+        File copy = new File(b.getRootDir(), "copy.dat");
+        CompletableFuture<Integer> notifiedBefore = new CompletableFuture<>();
+        execution.runInCpsVmThread(new FutureCallback<>() {
+            @Override
+            public void onSuccess(CpsThreadGroup g) {
+                try {
+                    // on the CPS VM thread, so no other save can interleave
+                    int n = rec.saves.size();
+                    g.saveProgram(copy);
+                    notifiedBefore.complete(rec.saves.size() - n);
+                } catch (Throwable t) {
+                    notifiedBefore.completeExceptionally(t);
+                }
+            }
+
+            @Override
+            public void onFailure(Throwable t) {
+                notifiedBefore.completeExceptionally(t);
+            }
+        });
+        assertEquals("no notification for the explicit file", 0, (int) notifiedBefore.get(30, TimeUnit.SECONDS));
+        assertTrue(copy.isFile());
+        SemaphoreStep.success("wait/1", null);
+        r.assertBuildStatusSuccess(r.waitForCompletion(b));
+    }
+
+    record Save(CpsFlowExecution execution, File file, boolean existed) {}
 
     @TestExtension
     public static class Recorder implements ProgramSavedListener {
@@ -83,13 +158,29 @@ public class ProgramSavedListenerTest {
 
         @Override
         public void onProgramSaved(CpsFlowExecution execution, File programDat) {
-            File record;
-            try {
-                record = new File(execution.getOwner().getRootDir(), "build.xml");
-            } catch (IOException e) {
-                throw new AssertionError(e);
+            saves.add(new Save(execution, programDat, programDat.isFile()));
+            events.add("notified");
+        }
+    }
+
+    @TestExtension("notifiedWithConsistentSavePoints")
+    public static class RecordSaves extends SaveableListener {
+        @Override
+        public void onChange(Saveable o, XmlFile file) {
+            if (o instanceof WorkflowRun run && run.getParent().getName().equals("p")) {
+                events.add("saved");
             }
-            saves.add(new Save(execution, programDat, programDat.isFile(), record.isFile()));
+        }
+    }
+
+    @TestExtension("throwingListenerDoesNotAffectBuild")
+    public static class Thrower implements ProgramSavedListener {
+        volatile int calls;
+
+        @Override
+        public void onProgramSaved(CpsFlowExecution execution, File programDat) {
+            calls++;
+            throw new LinkageError("simulated plugin mismatch");
         }
     }
 }
