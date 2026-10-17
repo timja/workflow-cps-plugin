@@ -610,18 +610,48 @@ public final class CpsThreadGroup implements Serializable {
             return;
         }
         File f = execution.getProgramDataFile();
-        saveProgram(f);
+        if (saveProgramTo(f)) {
+            fireProgramSaved(f);
+        }
     }
 
+    /**
+     * Notifies {@link ProgramSavedListener}s, first saving the build record so that it matches the program just saved.
+     * Does nothing, not even the extra save, when there are no listeners.
+     */
+    @CpsVmThreadOnly
+    private void fireProgramSaved(File f) {
+        List<ProgramSavedListener> listeners = ExtensionList.lookup(ProgramSavedListener.class);
+        if (listeners.isEmpty()) {
+            return;
+        }
+        execution.saveOwner();
+        for (ProgramSavedListener l : listeners) {
+            try {
+                l.onProgramSaved(execution, f);
+            } catch (VirtualMachineError e) {
+                throw e;
+            } catch (Throwable t) {
+                LOGGER.log(Level.WARNING, l + " failed after saving the program of " + execution, t);
+            }
+        }
+    }
+
+    /**
+     * Persists the current state of {@link CpsThreadGroup} to the given file.
+     * Unlike {@link #saveProgram()}, does not notify {@link ProgramSavedListener}s.
+     */
     @CpsVmThreadOnly
     public void saveProgram(File f) throws IOException {
-        File dir = f.getParentFile();
-        File tmpFile = File.createTempFile("atomic", null, dir);
+        saveProgramTo(f);
+    }
 
+    /**
+     * @return false if nothing was saved, because Jenkins is starting up or shutting down
+     */
+    @CpsVmThreadOnly
+    private boolean saveProgramTo(File f) throws IOException {
         assertVmThread();
-
-        CpsFlowExecution old = CpsFlowExecution.PROGRAM_STATE_SERIALIZATION.get();
-        CpsFlowExecution.PROGRAM_STATE_SERIALIZATION.set(execution);
 
         Collection<? extends PickleFactory> pickleFactories = PickleFactory.all();
         if (pickleFactories.isEmpty()) {
@@ -629,8 +659,14 @@ public final class CpsThreadGroup implements Serializable {
                     Level.WARNING,
                     "Skipping save to {0} since Jenkins seems to be either starting up or shutting down",
                     f);
-            return;
+            return false;
         }
+
+        File dir = f.getParentFile();
+        File tmpFile = File.createTempFile("atomic", null, dir);
+
+        CpsFlowExecution old = CpsFlowExecution.PROGRAM_STATE_SERIALIZATION.get();
+        CpsFlowExecution.PROGRAM_STATE_SERIALIZATION.set(execution);
 
         boolean serializedOK = false;
         try (CpsFlowExecution.Timing t = execution.time(CpsFlowExecution.TimingKind.saveProgram);
@@ -642,6 +678,7 @@ public final class CpsThreadGroup implements Serializable {
             Files.move(
                     tmpFile.toPath(), f.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             LOGGER.fine(() -> f + " saved");
+            return true;
         } catch (RuntimeException e) {
             propagateErrorToWorkflow(e);
             throw new IOException("Failed to persist " + f, e);
