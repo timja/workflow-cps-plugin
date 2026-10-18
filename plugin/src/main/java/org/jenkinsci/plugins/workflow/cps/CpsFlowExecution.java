@@ -146,6 +146,7 @@ import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException;
 import org.jenkinsci.plugins.workflow.steps.StepContext;
 import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.jenkinsci.plugins.workflow.support.concurrent.Futures;
+import org.jenkinsci.plugins.workflow.support.concurrent.Timeout;
 import org.jenkinsci.plugins.workflow.support.concurrent.WithThreadName;
 import org.jenkinsci.plugins.workflow.support.pickles.serialization.PickleResolver;
 import org.jenkinsci.plugins.workflow.support.pickles.serialization.RiverReader;
@@ -153,6 +154,7 @@ import org.jenkinsci.plugins.workflow.support.storage.BulkFlowNodeStorage;
 import org.jenkinsci.plugins.workflow.support.storage.FlowNodeStorage;
 import org.jenkinsci.plugins.workflow.support.storage.SimpleXStreamFlowNodeStorage;
 import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.DoNotUse;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.springframework.security.core.Authentication;
@@ -1411,6 +1413,54 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
                 return heads != null && super.isComplete();
             }
         }
+    }
+
+    /**
+     * Stops this execution where it is, without running any more of its program: unlike {@link #interrupt}, no
+     * {@code catch} or {@code finally} block, Declarative {@code post} section or other code runs, and the flow graph is
+     * not ended. Running steps are {@linkplain StepExecution#stop stopped} with {@code cause}, but their outcome is
+     * never delivered to the program.
+     *
+     * <p>Meant for an execution which carries on elsewhere (for example on another controller which took the build
+     * over from a save point), whose copy here must neither proceed nor complete. The owner is not told that the
+     * execution ended: it is the caller's to let go of the build without completing it. The execution is not saved
+     * again, and cannot be resumed afterwards.
+     *
+     * @param cause what the running steps are stopped with
+     * @return completes once the program stopped and its steps were asked to stop
+     */
+    @Restricted(Beta.class)
+    public CompletableFuture<Void> halt(@NonNull Throwable cause) {
+        CompletableFuture<Void> halted = new CompletableFuture<>();
+        LOGGER.log(Level.FINE, "Halting {0}", owner);
+        runInCpsVmThread(new FutureCallback<>() {
+            @Override
+            public void onSuccess(CpsThreadGroup g) {
+                try {
+                    g.pause(false); // nothing of the program runs from now on: not even the outcome of a stopped step
+                    for (CpsThread t : g.getThreads()) {
+                        StepExecution s = t.getStep();
+                        if (s != null) {
+                            try (Timeout timeout = Timeout.limit(30, TimeUnit.SECONDS)) {
+                                s.stop(cause);
+                            } catch (Exception x) {
+                                LOGGER.log(Level.WARNING, "Failed to stop " + s + " in " + owner, x);
+                            }
+                        }
+                    }
+                    cleanUpHeap();
+                    halted.complete(null);
+                } catch (RuntimeException x) {
+                    halted.completeExceptionally(x);
+                }
+            }
+
+            @Override
+            public void onFailure(Throwable t) {
+                halted.completeExceptionally(t);
+            }
+        });
+        return halted;
     }
 
     /**
